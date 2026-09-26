@@ -29,8 +29,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent",
-                                           accessibilityDescription: "AI 额度")
+        statusItem.button?.image = NSImage(systemSymbolName: "fuelpump.fill",
+                                           accessibilityDescription: "TokenTank")
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusClicked)
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])

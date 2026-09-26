@@ -28,7 +28,7 @@ struct ContentView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Text("AI 额度").font(.system(size: 13, weight: .bold))
+            Text("TokenTank").font(.system(size: 13, weight: .bold))
             if let t = model.updatedAt {
                 Text("\(Fmt.time(t)) 更新").font(.system(size: 10)).foregroundStyle(.secondary)
             }

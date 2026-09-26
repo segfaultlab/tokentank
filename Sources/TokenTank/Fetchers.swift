@@ -74,7 +74,7 @@ enum CodexQuota {
         }
 
         let messages = [
-            #"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"quota-float","version":"1.0"}}}"#,
+            #"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"tokentank","version":"1.0"}}}"#,
             #"{"method":"initialized"}"#,
             #"{"id":2,"method":"account/rateLimits/read"}"#,
         ]

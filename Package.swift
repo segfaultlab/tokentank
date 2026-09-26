@@ -2,9 +2,9 @@
 import PackageDescription
 
 let package = Package(
-    name: "QuotaFloat",
+    name: "TokenTank",
     platforms: [.macOS(.v14)],
     targets: [
-        .executableTarget(name: "QuotaFloat", path: "Sources/QuotaFloat")
+        .executableTarget(name: "TokenTank", path: "Sources/TokenTank")
     ]
 )

@@ -1,0 +1,34 @@
+{
+  "name": "tokentank",
+  "version": "0.1.0",
+  "description": "Mac 菜单栏小工具：查看 Claude / Codex / Grok 会员额度，一键升级 CLI",
+  "bin": {
+    "tokentank": "bin/tokentank.js"
+  },
+  "files": [
+    "bin",
+    "app"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "scripts": {
+    "build": "./build.sh",
+    "prepublishOnly": "./build.sh"
+  },
+  "keywords": [
+    "claude",
+    "codex",
+    "grok",
+    "quota",
+    "usage",
+    "menubar",
+    "macos"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/segfaultlab/tokentank.git"
+  },
+  "homepage": "https://github.com/segfaultlab/tokentank#readme",
+  "license": "MIT"
+}
