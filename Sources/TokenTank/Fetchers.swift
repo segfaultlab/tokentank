@@ -2,22 +2,30 @@ import Foundation
 
 struct FetchError: LocalizedError {
     let message: String
-    init(_ message: String) { self.message = message }
+    var quiet = false
+    init(_ message: String, quiet: Bool = false) {
+        self.message = message
+        self.quiet = quiet
+    }
     var errorDescription: String? { message }
 }
 
-struct QuotaWindow: Identifiable {
-    let id = UUID()
+struct QuotaWindow: Identifiable, Codable {
+    var id = UUID()
     let label: String
     let usedPercent: Double
     let resetsAt: Date?
+
+    enum CodingKeys: String, CodingKey { case label, usedPercent, resetsAt }
 }
 
-struct Quota {
+struct Quota: Codable {
     var plan: String?
     var windows: [QuotaWindow]
     var note: String?
     var fetchedAt = Date()
+
+    enum CodingKeys: String, CodingKey { case plan, windows, fetchedAt }
 }
 
 enum Shell {
@@ -181,14 +189,26 @@ enum ClaudeQuota {
         return creds
     }
 
-    private static var lastQuota: (quota: Quota, at: Date)?
-    private static var blockedUntil = Date.distantPast
+    private static let defaults = UserDefaults.standard
+
+    private static var savedQuota: Quota? {
+        get { defaults.data(forKey: "claude.lastQuota").flatMap { try? JSONDecoder().decode(Quota.self, from: $0) } }
+        set { defaults.set(newValue.flatMap { try? JSONEncoder().encode($0) }, forKey: "claude.lastQuota") }
+    }
+
+    private static var nextRequestAt: Date {
+        get { defaults.object(forKey: "claude.nextRequestAt") as? Date ?? .distantPast }
+        set { defaults.set(newValue, forKey: "claude.nextRequestAt") }
+    }
+
+    private static func waitOrSaved() throws -> Quota {
+        if let savedQuota { return savedQuota }
+        throw FetchError("暂无数据，稍后自动获取", quiet: true)
+    }
 
     static func fetch() async throws -> Quota {
-        if let lastQuota, Date().timeIntervalSince(lastQuota.at) < 300 { return lastQuota.quota }
-        guard Date() >= blockedUntil else {
-            throw FetchError("Claude 请求太频繁，\(Fmt.time(blockedUntil)) 后再试")
-        }
+        guard Date() >= nextRequestAt else { return try waitOrSaved() }
+        nextRequestAt = Date().addingTimeInterval(300)
         let creds = try await loadCredentials()
         guard creds.expires > Date() else {
             cached = nil
@@ -202,9 +222,9 @@ enum ClaudeQuota {
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         if code == 401 { cached = nil }
         if code == 429 {
-            let wait = ((resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")).flatMap(Double.init) ?? 600
-            blockedUntil = Date().addingTimeInterval(max(wait, 60))
-            throw FetchError("Claude 请求太频繁，\(Fmt.time(blockedUntil)) 后再试")
+            let wait = ((resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")).flatMap(Double.init) ?? 0
+            nextRequestAt = Date().addingTimeInterval(max(wait, 600))
+            return try waitOrSaved()
         }
         guard code == 200 else { throw FetchError("Claude 返回 HTTP \(code)") }
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -219,7 +239,7 @@ enum ClaudeQuota {
             return QuotaWindow(label: label, usedPercent: used, resetsAt: parseISODate(w["resets_at"] as? String))
         }
         let quota = Quota(plan: creds.plan, windows: windows)
-        lastQuota = (quota, Date())
+        savedQuota = quota
         return quota
     }
 }

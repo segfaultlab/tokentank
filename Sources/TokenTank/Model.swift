@@ -3,6 +3,7 @@ import AppKit
 enum Load {
     case loading
     case loaded(Quota)
+    case pending(String)
     case failed(String)
 }
 
@@ -67,13 +68,26 @@ final class Model: ObservableObject {
     }
 
     private static func keepLastGood(_ old: Load, _ new: Load) -> Load {
-        guard case .failed(let message) = new, case .loaded(var quota) = old else { return new }
-        quota.note = "\(message)，显示的是 \(Fmt.time(quota.fetchedAt)) 的数据"
-        return .loaded(quota)
+        guard case .loaded(var quota) = old else { return new }
+        switch new {
+        case .pending:
+            return old
+        case .failed(let message):
+            quota.note = "\(message)，显示的是 \(Fmt.time(quota.fetchedAt)) 的数据"
+            return .loaded(quota)
+        default:
+            return new
+        }
     }
 
     nonisolated private static func load(_ fetch: () async throws -> Quota) async -> Load {
-        do { return .loaded(try await fetch()) } catch { return .failed(error.localizedDescription) }
+        do {
+            return .loaded(try await fetch())
+        } catch let error as FetchError where error.quiet {
+            return .pending(error.message)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
     }
 
     func checkVersions() async {

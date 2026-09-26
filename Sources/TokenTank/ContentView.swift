@@ -19,6 +19,8 @@ struct ContentView: View {
             QuotaSection(name: "Grok", load: model.grok)
             Divider()
             versions
+            Divider()
+            footer
         }
         .padding(14)
         .frame(width: 270)
@@ -35,15 +37,30 @@ struct ContentView: View {
             }
             Spacer()
             if model.refreshing {
-                ProgressView().controlSize(.mini)
+                ProgressView().controlSize(.mini).frame(width: 22, height: 22)
             } else {
                 Button { model.refreshAll() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(HoverIconButtonStyle())
                     .help("刷新额度和版本")
             }
         }
-        .frame(height: 16)
+        .frame(height: 22)
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
+    }
+
+    private var footer: some View {
+        HStack {
+            Text("TokenTank \(model.selfVersion ?? "")")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+            Spacer()
+            Button { NSApp.terminate(nil) } label: {
+                Image(systemName: "power").font(.system(size: 11, weight: .medium))
+            }
+            .buttonStyle(HoverIconButtonStyle())
+            .help("退出 TokenTank")
+        }
     }
 
     private var selfUpdateBadge: some View {
@@ -92,6 +109,28 @@ struct ContentView: View {
     }
 }
 
+struct HoverIconButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HoverIcon(configuration: configuration)
+    }
+
+    private struct HoverIcon: View {
+        let configuration: ButtonStyleConfiguration
+        @State private var hovering = false
+
+        var body: some View {
+            configuration.label
+                .foregroundStyle(hovering ? .primary : .secondary)
+                .frame(width: 22, height: 22)
+                .background(RoundedRectangle(cornerRadius: 6)
+                    .fill(.primary.opacity(configuration.isPressed ? 0.16 : hovering ? 0.08 : 0)))
+                .contentShape(Rectangle())
+                .onHover { hovering = $0 }
+                .animation(.easeOut(duration: 0.12), value: hovering)
+        }
+    }
+}
+
 struct QuotaSection: View {
     let name: String
     let load: Load
@@ -109,6 +148,8 @@ struct QuotaSection: View {
             switch load {
             case .loading:
                 ProgressView().controlSize(.small)
+            case .pending(let msg):
+                Text(msg).font(.system(size: 11)).foregroundStyle(.secondary)
             case .failed(let msg):
                 Text(msg).font(.system(size: 11)).foregroundStyle(.red).lineLimit(2)
             case .loaded(let q):
