@@ -1,33 +1,20 @@
 import AppKit
 import SwiftUI
 
-final class FloatingPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-}
-
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var panel: FloatingPanel!
     private var statusItem: NSStatusItem!
+    private let popover = NSPopover()
     private let model = Model()
+    private var outsideClickMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let host = NSHostingController(rootView: ContentView(model: model) { [weak self] in
-            self?.panel.orderOut(nil)
-        })
+        let host = NSHostingController(rootView: ContentView(model: model))
         host.sizingOptions = .preferredContentSize
+        popover.contentViewController = host
+        popover.behavior = .applicationDefined
+        popover.animates = true
 
-        panel = FloatingPanel(contentRect: NSRect(x: 0, y: 0, width: 270, height: 360),
-                              styleMask: [.borderless, .nonactivatingPanel],
-                              backing: .buffered, defer: false)
-        panel.contentViewController = host
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.level = .floating
-        panel.isMovableByWindowBackground = true
-        panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "fuelpump.fill",
                                            accessibilityDescription: "TokenTank")
@@ -35,34 +22,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.action = #selector(statusClicked)
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            Task { @MainActor in self?.closePopover() }
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.closePopover() }
+        }
+
         model.start()
-        showPanel()
+        showPopover()
     }
 
     @objc private func statusClicked() {
         if NSApp.currentEvent?.type == .rightMouseUp {
+            closePopover()
             let menu = NSMenu()
             menu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
             statusItem.menu = menu
             statusItem.button?.performClick(nil)
             statusItem.menu = nil
-        } else if panel.isVisible {
-            panel.orderOut(nil)
+        } else if popover.isShown {
+            closePopover()
         } else {
             model.refreshQuota()
-            showPanel()
+            showPopover()
         }
     }
 
-    private func showPanel() {
-        if let button = statusItem.button, let window = button.window {
-            let icon = window.convertToScreen(button.convert(button.bounds, to: nil))
-            let screen = window.screen?.visibleFrame ?? NSScreen.main!.visibleFrame
-            let width = panel.frame.width
-            let x = min(max(icon.midX - width / 2, screen.minX + 8), screen.maxX - width - 8)
-            panel.setFrameTopLeftPoint(NSPoint(x: x, y: icon.minY - 6))
-        }
-        panel.orderFrontRegardless()
+    private func showPopover() {
+        guard let button = statusItem.button else { return }
+        NSApp.activate()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    }
+
+    private func closePopover() {
+        if popover.isShown { popover.performClose(nil) }
     }
 }
 

@@ -10,7 +10,6 @@ enum Fmt {
 
 struct ContentView: View {
     @ObservedObject var model: Model
-    var onHide: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -23,7 +22,6 @@ struct ContentView: View {
         }
         .padding(14)
         .frame(width: 270)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
     private var header: some View {
@@ -33,16 +31,14 @@ struct ContentView: View {
                 Text("\(Fmt.time(t)) 更新").font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Spacer()
-            Button { model.refreshAll() } label: {
-                Image(systemName: "arrow.clockwise")
-                    .rotationEffect(.degrees(model.refreshing ? 360 : 0))
-                    .animation(model.refreshing ? .linear(duration: 1).repeatForever(autoreverses: false) : .default,
-                               value: model.refreshing)
+            if model.refreshing {
+                ProgressView().controlSize(.mini)
+            } else {
+                Button { model.refreshAll() } label: { Image(systemName: "arrow.clockwise") }
+                    .help("刷新额度和版本")
             }
-            .help("刷新额度和版本")
-            Button(action: onHide) { Image(systemName: "xmark") }
-                .help("收起（点菜单栏图标再打开）")
         }
+        .frame(height: 16)
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
     }
