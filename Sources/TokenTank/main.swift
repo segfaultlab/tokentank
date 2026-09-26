@@ -45,7 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if popover.isShown {
             closePopover()
         } else {
-            model.refreshQuota()
+            model.refreshQuotaIfStale()
             showPopover()
         }
     }

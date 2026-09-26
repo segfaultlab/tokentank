@@ -16,6 +16,8 @@ struct QuotaWindow: Identifiable {
 struct Quota {
     var plan: String?
     var windows: [QuotaWindow]
+    var note: String?
+    var fetchedAt = Date()
 }
 
 enum Shell {
@@ -179,7 +181,14 @@ enum ClaudeQuota {
         return creds
     }
 
+    private static var lastQuota: (quota: Quota, at: Date)?
+    private static var blockedUntil = Date.distantPast
+
     static func fetch() async throws -> Quota {
+        if let lastQuota, Date().timeIntervalSince(lastQuota.at) < 300 { return lastQuota.quota }
+        guard Date() >= blockedUntil else {
+            throw FetchError("Claude 请求太频繁，\(Fmt.time(blockedUntil)) 后再试")
+        }
         let creds = try await loadCredentials()
         guard creds.expires > Date() else {
             cached = nil
@@ -192,6 +201,11 @@ enum ClaudeQuota {
         let (data, resp) = try await URLSession.shared.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         if code == 401 { cached = nil }
+        if code == 429 {
+            let wait = ((resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")).flatMap(Double.init) ?? 600
+            blockedUntil = Date().addingTimeInterval(max(wait, 60))
+            throw FetchError("Claude 请求太频繁，\(Fmt.time(blockedUntil)) 后再试")
+        }
         guard code == 200 else { throw FetchError("Claude 返回 HTTP \(code)") }
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw FetchError("Claude 返回格式看不懂")
@@ -204,7 +218,9 @@ enum ClaudeQuota {
                   let used = (w["utilization"] as? NSNumber)?.doubleValue else { return nil }
             return QuotaWindow(label: label, usedPercent: used, resetsAt: parseISODate(w["resets_at"] as? String))
         }
-        return Quota(plan: creds.plan, windows: windows)
+        let quota = Quota(plan: creds.plan, windows: windows)
+        lastQuota = (quota, Date())
+        return quota
     }
 }
 

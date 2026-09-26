@@ -27,6 +27,9 @@ struct ContentView: View {
     private var header: some View {
         HStack(spacing: 8) {
             Text("TokenTank").font(.system(size: 13, weight: .bold))
+            if model.selfOutdated || model.selfUpdating {
+                selfUpdateBadge
+            }
             if let t = model.updatedAt {
                 Text("\(Fmt.time(t)) 更新").font(.system(size: 10)).foregroundStyle(.secondary)
             }
@@ -41,6 +44,21 @@ struct ContentView: View {
         .frame(height: 16)
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
+    }
+
+    private var selfUpdateBadge: some View {
+        let failed = model.selfUpdateError != nil
+        let title = model.selfUpdating ? "更新中…" : failed ? "升级失败" : "↑ \(model.selfLatest ?? "")"
+        return Button { model.selfUpdate() } label: {
+            Text(title)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(failed ? Color.red : Color.accentColor, in: Capsule())
+        }
+        .disabled(model.selfUpdating)
+        .help(model.selfUpdateError ?? "TokenTank 有新版本，点击升级并重启")
     }
 
     private var versions: some View {
@@ -95,6 +113,9 @@ struct QuotaSection: View {
                 Text(msg).font(.system(size: 11)).foregroundStyle(.red).lineLimit(2)
             case .loaded(let q):
                 ForEach(q.windows) { WindowRow(window: $0) }
+                if let note = q.note {
+                    Text(note).font(.system(size: 10)).foregroundStyle(.orange).lineLimit(2)
+                }
             }
         }
     }
