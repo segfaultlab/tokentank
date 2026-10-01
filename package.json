@@ -1,6 +1,6 @@
 {
   "name": "tokentank",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Mac 菜单栏小工具：查看 Claude / Codex / Grok 会员额度，一键升级 CLI",
   "bin": {
     "tokentank": "bin/tokentank.js"
