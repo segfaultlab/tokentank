@@ -1,10 +1,17 @@
 import SwiftUI
 
 enum Fmt {
-    static func time(_ date: Date) -> String {
+    private static let today = formatter("HH:mm")
+    private static let other = formatter("M/d HH:mm")
+
+    private static func formatter(_ format: String) -> DateFormatter {
         let f = DateFormatter()
-        f.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm" : "M/d HH:mm"
-        return f.string(from: date)
+        f.dateFormat = format
+        return f
+    }
+
+    static func time(_ date: Date) -> String {
+        (Calendar.current.isDateInToday(date) ? today : other).string(from: date)
     }
 }
 
@@ -14,9 +21,9 @@ struct ContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
-            QuotaSection(name: "Claude", load: model.claude)
-            QuotaSection(name: "Codex", load: model.codex)
-            QuotaSection(name: "Grok", load: model.grok)
+            ForEach(Provider.allCases) { p in
+                QuotaSection(provider: p, load: model.quotas[p] ?? .loading, loading: model.inFlight.contains(p))
+            }
             Divider()
             versions
             Divider()
@@ -32,17 +39,10 @@ struct ContentView: View {
             if model.selfOutdated || model.selfUpdating {
                 selfUpdateBadge
             }
-            if let t = model.updatedAt {
-                Text("\(Fmt.time(t)) 更新").font(.system(size: 10)).foregroundStyle(.secondary)
-            }
             Spacer()
-            if model.refreshing {
-                ProgressView().controlSize(.mini).frame(width: 22, height: 22)
-            } else {
-                Button { model.refreshAll() } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(HoverIconButtonStyle())
-                    .help("刷新额度和版本")
-            }
+            Button { model.refreshAll() } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(HoverIconButtonStyle())
+                .help("刷新额度和版本")
         }
         .frame(height: 22)
         .buttonStyle(.plain)
@@ -74,7 +74,7 @@ struct ContentView: View {
                 .padding(.vertical, 2)
                 .background(failed ? Color.red : Color.accentColor, in: Capsule())
         }
-        .disabled(model.selfUpdating)
+        .disabled(model.selfUpdating || model.upgrading)
         .help(model.selfUpdateError ?? "TokenTank 有新版本，点击升级并重启")
     }
 
@@ -99,13 +99,17 @@ struct ContentView: View {
     }
 
     private var canUpgrade: Bool {
-        !model.upgrading && !model.checkingVersions && model.outdatedCount > 0
+        !model.upgrading && !model.selfUpdating && !model.checkingVersions && model.outdatedCount > 0
     }
 
     private var upgradeTitle: String {
-        if model.upgrading { return "升级中…" }
+        if model.upgrading {
+            let name = model.tools.first { $0.state == .updating }?.id
+            return name.map { "正在升级 \($0)…" } ?? "升级中…"
+        }
         if model.checkingVersions { return "检查版本中…" }
-        return model.outdatedCount > 0 ? "一键升级（\(model.outdatedCount) 个）" : "都是最新版"
+        if model.outdatedCount > 0 { return "一键升级（\(model.outdatedCount) 个）" }
+        return model.tools.contains(where: \.unknown) ? "部分版本查不到" : "都是最新版"
     }
 }
 
@@ -132,33 +136,50 @@ struct HoverIconButtonStyle: ButtonStyle {
 }
 
 struct QuotaSection: View {
-    let name: String
+    let provider: Provider
     let load: Load
+    let loading: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Text(name).font(.system(size: 12, weight: .semibold))
+                Text(provider.rawValue).font(.system(size: 12, weight: .semibold))
                 if case .loaded(let q) = load, let plan = q.plan {
                     Text(plan).font(.system(size: 9, weight: .medium))
                         .padding(.horizontal, 5).padding(.vertical, 1)
                         .background(.quaternary, in: Capsule())
                 }
+                Spacer()
+                if loading {
+                    ProgressView().controlSize(.mini).scaleEffect(0.8)
+                }
+                if case .loaded(let q) = load {
+                    Text("数据于 \(Fmt.time(q.fetchedAt))")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .help(timeHelp)
+                }
             }
+            .frame(height: 16)
             switch load {
             case .loading:
                 ProgressView().controlSize(.small)
             case .pending(let msg):
                 Text(msg).font(.system(size: 11)).foregroundStyle(.secondary)
             case .failed(let msg):
-                Text(msg).font(.system(size: 11)).foregroundStyle(.red).lineLimit(2)
+                Text(msg).font(.system(size: 11)).foregroundStyle(.red).lineLimit(2).help(msg)
             case .loaded(let q):
                 ForEach(q.windows) { WindowRow(window: $0) }
                 if let note = q.note {
-                    Text(note).font(.system(size: 10)).foregroundStyle(.orange).lineLimit(2)
+                    Text("刷新失败，显示的是旧数据").font(.system(size: 10)).foregroundStyle(.orange).help(note)
                 }
             }
         }
+    }
+
+    private var timeHelp: String {
+        guard provider == .claude else { return "每 5 分钟自动刷新" }
+        let next = ClaudeQuota.nextRequestAt
+        return next > Date() ? "Claude 用量接口限流严格，\(Fmt.time(next)) 后才会再次查询" : "每 5 分钟自动刷新"
     }
 }
 
@@ -174,7 +195,7 @@ struct WindowRow: View {
             HStack {
                 Text(window.label)
                 Spacer()
-                Text("已用 \(Int(window.usedPercent.rounded()))%").monospacedDigit()
+                Text("已用 \(window.usedPercent, format: .number.precision(.fractionLength(0)))%").monospacedDigit()
             }
             .font(.system(size: 11))
             GeometryReader { geo in
@@ -205,12 +226,18 @@ struct ToolRow: View {
     }
 
     private var versionText: String {
-        guard let current = tool.current else { return tool.latest == nil ? "…" : "未安装" }
-        return tool.outdated ? "\(current) → \(tool.latest!)" : current
+        if !tool.checked { return "…" }
+        switch tool.current {
+        case .missing: return "未安装"
+        case .unknown: return "查不到版本"
+        case .version(let v): return tool.outdated ? "\(v) → \(tool.latest.version!)" : v
+        }
     }
 
     @ViewBuilder private var status: some View {
         switch tool.state {
+        case .queued:
+            Image(systemName: "clock").foregroundStyle(.secondary).help("等待升级")
         case .updating:
             ProgressView().controlSize(.mini)
         case .failed(let msg):
@@ -218,8 +245,11 @@ struct ToolRow: View {
         default:
             if tool.outdated {
                 Image(systemName: "arrow.up.circle.fill").foregroundStyle(.orange).help("有新版本")
-            } else if tool.current != nil {
+            } else if tool.upToDate {
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).help("已是最新")
+            } else if tool.unknown {
+                Image(systemName: "questionmark.circle").foregroundStyle(.secondary)
+                    .help(tool.current == .unknown ? "读取本地版本失败" : "查不到最新版本")
             }
         }
     }

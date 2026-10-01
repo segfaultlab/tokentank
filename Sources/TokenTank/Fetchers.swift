@@ -42,18 +42,99 @@ enum Shell {
         return p
     }
 
-    static func run(_ command: String) async -> (status: Int32, output: String) {
-        await Task.detached {
+    static func run(_ command: String, timeout: TimeInterval = 60) async -> (status: Int32, output: String) {
+        await withCheckedContinuation { cont in
             let p = process(command)
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = pipe
             p.standardInput = FileHandle.nullDevice
-            do { try p.run() } catch { return (-1, error.localizedDescription) }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            return (p.terminationStatus, String(decoding: data, as: UTF8.self))
-        }.value
+            let buffer = OutputBuffer()
+            let eof = DispatchSemaphore(value: 0)
+            pipe.fileHandleForReading.readabilityHandler = { h in
+                if buffer.read(h) {
+                    h.readabilityHandler = nil
+                    eof.signal()
+                }
+            }
+            let cleaned = DispatchSemaphore(value: 0)
+            p.terminationHandler = { p in
+                buffer.markExited()
+                _ = eof.wait(timeout: .now() + 1)
+                pipe.fileHandleForReading.readabilityHandler = nil
+                let (output, timedOut) = buffer.finish(draining: pipe.fileHandleForReading)
+                if timedOut {
+                    _ = cleaned.wait(timeout: .now() + 10)
+                    cont.resume(returning: (-1, "命令超过 \(Int(timeout)) 秒没有结束，已终止"))
+                } else {
+                    cont.resume(returning: (p.terminationStatus, output))
+                }
+            }
+            do {
+                try p.run()
+            } catch {
+                pipe.fileHandleForReading.readabilityHandler = nil
+                cont.resume(returning: (-1, error.localizedDescription))
+                return
+            }
+            let pgid = p.processIdentifier
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                guard buffer.markTimedOut() else { return }
+                terminateGroup(pgid)
+                cleaned.signal()
+            }
+        }
+    }
+
+    static func terminateGroup(_ pgid: pid_t) {
+        guard kill(-pgid, SIGTERM) == 0 else { return }
+        for _ in 0..<30 {
+            usleep(100_000)
+            if kill(-pgid, 0) != 0 { return }
+        }
+        kill(-pgid, SIGKILL)
+    }
+}
+
+final class OutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    private var exited = false
+    private var finished = false
+    private var didTimeOut = false
+
+    var timedOut: Bool { lock.withLock { didTimeOut } }
+
+    func read(_ h: FileHandle) -> Bool {
+        lock.withLock {
+            let chunk = h.availableData
+            if !finished { data.append(chunk) }
+            return chunk.isEmpty
+        }
+    }
+
+    func markExited() { lock.withLock { exited = true } }
+
+    func markTimedOut() -> Bool {
+        lock.withLock {
+            if !exited { didTimeOut = true }
+            return didTimeOut
+        }
+    }
+
+    func finish(draining h: FileHandle) -> (String, Bool) {
+        lock.withLock {
+            let fd = h.fileDescriptor
+            _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+            var chunk = [UInt8](repeating: 0, count: 65536)
+            while true {
+                let n = Darwin.read(fd, &chunk, chunk.count)
+                if n <= 0 { break }
+                data.append(contentsOf: chunk[0..<n])
+            }
+            finished = true
+            return (String(decoding: data, as: UTF8.self), didTimeOut)
+        }
     }
 }
 
@@ -62,6 +143,14 @@ func parseISODate(_ string: String?) -> Date? {
     if let r = s.range(of: #"\.\d+"#, options: .regularExpression) { s.removeSubrange(r) }
     return ISO8601DateFormatter().date(from: s)
 }
+
+private let httpDateFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = TimeZone(identifier: "GMT")
+    f.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+    return f
+}()
 
 enum CodexQuota {
     static func fetch() async throws -> Quota {
@@ -75,12 +164,15 @@ enum CodexQuota {
         p.standardOutput = output
         p.standardError = FileHandle.nullDevice
         try p.run()
-        let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: killer)
+        let pgid = p.processIdentifier
+        let state = OutputBuffer()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30) {
+            if state.markTimedOut() { Shell.terminateGroup(pgid) }
+        }
         defer {
-            killer.cancel()
+            state.markExited()
             try? input.fileHandleForWriting.close()
-            if p.isRunning { p.terminate() }
+            DispatchQueue.global().async { Shell.terminateGroup(pgid) }
         }
 
         let messages = [
@@ -88,13 +180,15 @@ enum CodexQuota {
             #"{"method":"initialized"}"#,
             #"{"id":2,"method":"account/rateLimits/read"}"#,
         ]
-        input.fileHandleForWriting.write(Data((messages.joined(separator: "\n") + "\n").utf8))
+        try input.fileHandleForWriting.write(contentsOf: Data((messages.joined(separator: "\n") + "\n").utf8))
 
         var buffer = Data()
         let reader = output.fileHandleForReading
         while true {
             let chunk = reader.availableData
-            if chunk.isEmpty { throw FetchError("codex 没有返回额度，确认已登录") }
+            if chunk.isEmpty {
+                throw FetchError(state.timedOut ? "codex 30 秒内没有返回额度" : "codex 没有返回额度，确认已登录")
+            }
             buffer.append(chunk)
             while let nl = buffer.firstIndex(of: 0x0A) {
                 let line = buffer.subdata(in: buffer.startIndex..<nl)
@@ -115,11 +209,12 @@ enum CodexQuota {
         }
         let windows = ["primary", "secondary"].compactMap { key -> QuotaWindow? in
             guard let w = limits[key] as? [String: Any],
-                  let used = (w["usedPercent"] as? NSNumber)?.doubleValue else { return nil }
+                  let used = (w["usedPercent"] as? NSNumber)?.doubleValue, used.isFinite else { return nil }
             let mins = (w["windowDurationMins"] as? NSNumber)?.intValue ?? 0
             let resets = (w["resetsAt"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
             return QuotaWindow(label: windowLabel(mins), usedPercent: used, resetsAt: resets)
         }
+        guard !windows.isEmpty else { throw FetchError("codex 返回里没有额度信息") }
         return Quota(plan: (limits["planType"] as? String)?.capitalized, windows: windows)
     }
 
@@ -162,7 +257,9 @@ enum GrokQuota {
         }
 
         let rawUsed = config["creditUsagePercent"]
-        let used = (rawUsed as? NSNumber)?.doubleValue ?? Double(rawUsed as? String ?? "") ?? 0
+        guard let used = (rawUsed as? NSNumber)?.doubleValue ?? Double(rawUsed as? String ?? ""), used.isFinite else {
+            throw FetchError("Grok 返回里没有用量百分比")
+        }
         let period = config["currentPeriod"] as? [String: Any]
         let label = (period?["type"] as? String)?.contains("MONTH") == true ? "本月" : "本周"
         let end = parseISODate(period?["end"] as? String ?? config["billingPeriodEnd"] as? String)
@@ -175,7 +272,7 @@ enum ClaudeQuota {
 
     private static func loadCredentials() async throws -> (token: String, plan: String?, expires: Date) {
         if let cached, cached.expires > Date().addingTimeInterval(60) { return cached }
-        let result = await Shell.run("security find-generic-password -s 'Claude Code-credentials' -w")
+        let result = await Shell.run("security find-generic-password -s 'Claude Code-credentials' -w", timeout: 300)
         guard result.status == 0,
               let obj = try? JSONSerialization.jsonObject(with: Data(result.output.utf8)) as? [String: Any],
               let oauth = obj["claudeAiOauth"] as? [String: Any],
@@ -191,29 +288,32 @@ enum ClaudeQuota {
 
     private static let defaults = UserDefaults.standard
 
-    private static var savedQuota: Quota? {
+    static var savedQuota: Quota? {
         get { defaults.data(forKey: "claude.lastQuota").flatMap { try? JSONDecoder().decode(Quota.self, from: $0) } }
         set { defaults.set(newValue.flatMap { try? JSONEncoder().encode($0) }, forKey: "claude.lastQuota") }
     }
 
-    private static var nextRequestAt: Date {
+    static var nextRequestAt: Date {
         get { defaults.object(forKey: "claude.nextRequestAt") as? Date ?? .distantPast }
         set { defaults.set(newValue, forKey: "claude.nextRequestAt") }
     }
 
-    private static func waitOrSaved() throws -> Quota {
-        if let savedQuota { return savedQuota }
-        throw FetchError("暂无数据，稍后自动获取", quiet: true)
+    private static func retryAfter(_ resp: URLResponse) -> Date? {
+        guard let value = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After") else { return nil }
+        if let seconds = Double(value) { return Date().addingTimeInterval(seconds) }
+        return httpDateFormatter.date(from: value)
     }
 
     static func fetch() async throws -> Quota {
-        guard Date() >= nextRequestAt else { return try waitOrSaved() }
-        nextRequestAt = Date().addingTimeInterval(300)
         let creds = try await loadCredentials()
         guard creds.expires > Date() else {
             cached = nil
             throw FetchError("Claude 登录已过期，打开一次 claude 会自动刷新")
         }
+        guard Date() >= nextRequestAt else {
+            throw FetchError("暂无数据，\(Fmt.time(nextRequestAt)) 后自动获取", quiet: true)
+        }
+        nextRequestAt = Date().addingTimeInterval(300)
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         req.setValue("Bearer \(creds.token)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
@@ -222,9 +322,8 @@ enum ClaudeQuota {
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         if code == 401 { cached = nil }
         if code == 429 {
-            let wait = ((resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")).flatMap(Double.init) ?? 0
-            nextRequestAt = Date().addingTimeInterval(max(wait, 600))
-            return try waitOrSaved()
+            nextRequestAt = max(Date().addingTimeInterval(600), retryAfter(resp) ?? .distantPast)
+            throw FetchError("暂无数据，\(Fmt.time(nextRequestAt)) 后自动获取", quiet: true)
         }
         guard code == 200 else { throw FetchError("Claude 返回 HTTP \(code)") }
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -235,9 +334,10 @@ enum ClaudeQuota {
                     ("seven_day_opus", "本周 · Opus"), ("seven_day_sonnet", "本周 · Sonnet")]
         let windows = keys.compactMap { key, label -> QuotaWindow? in
             guard let w = obj[key] as? [String: Any],
-                  let used = (w["utilization"] as? NSNumber)?.doubleValue else { return nil }
+                  let used = (w["utilization"] as? NSNumber)?.doubleValue, used.isFinite else { return nil }
             return QuotaWindow(label: label, usedPercent: used, resetsAt: parseISODate(w["resets_at"] as? String))
         }
+        guard !windows.isEmpty else { throw FetchError("Claude 返回里没有额度信息") }
         let quota = Quota(plan: creds.plan, windows: windows)
         savedQuota = quota
         return quota
@@ -245,7 +345,20 @@ enum ClaudeQuota {
 }
 
 enum UpdateState: Equatable {
-    case idle, updating, done, failed(String)
+    case idle, queued, updating, failed(String)
+}
+
+enum Probe: Equatable {
+    case unknown, missing, version(String)
+
+    var version: String? {
+        if case .version(let v) = self { return v }
+        return nil
+    }
+}
+
+func isNewer(_ a: String, than b: String) -> Bool {
+    a.compare(b, options: .numeric) == .orderedDescending
 }
 
 struct Tool: Identifiable {
@@ -253,14 +366,18 @@ struct Tool: Identifiable {
     let currentCommand: String
     let latestCommand: String
     let upgradeCommand: String
-    var current: String?
-    var latest: String?
+    var current: Probe = .unknown
+    var latest: Probe = .unknown
+    var checked = false
     var state: UpdateState = .idle
 
     var outdated: Bool {
-        guard let current, let latest else { return false }
-        return current != latest
+        guard let c = current.version, let l = latest.version else { return false }
+        return isNewer(l, than: c)
     }
+
+    var upToDate: Bool { current.version != nil && latest.version != nil && !outdated }
+    var unknown: Bool { checked && current != .missing && !upToDate && !outdated }
 
     static let all = [
         Tool(id: "claude",
@@ -272,29 +389,40 @@ struct Tool: Identifiable {
              latestCommand: "npm view @openai/codex version",
              upgradeCommand: "npm install -g @openai/codex@latest"),
         Tool(id: "grok",
-             currentCommand: "grok update --check --json",
+             currentCommand: "grok --version",
              latestCommand: "grok update --check --json",
              upgradeCommand: "grok update"),
     ]
 }
 
 enum Versions {
-    static func check(_ tool: Tool) async -> (current: String?, latest: String?) {
-        if tool.id == "grok" {
-            let out = await Shell.run(tool.currentCommand).output
-            guard let line = out.split(separator: "\n").last(where: { $0.hasPrefix("{") }),
-                  let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
-            else { return (nil, nil) }
-            return (obj["currentVersion"] as? String, obj["latestVersion"] as? String)
-        }
-        async let cur = Shell.run(tool.currentCommand)
-        async let lat = Shell.run(tool.latestCommand)
-        return (lastVersion(in: await cur), lastVersion(in: await lat))
+    static func check(_ tool: Tool) async -> (current: Probe, latest: Probe) {
+        async let cur = current(tool)
+        async let lat = latest(tool)
+        return await (cur, lat)
     }
 
-    private static func lastVersion(in result: (status: Int32, output: String)) -> String? {
-        guard result.status == 0 else { return nil }
-        let matches = result.output.matches(of: #/\d+\.\d+\.\d+[\w.\-]*/#)
-        return matches.last.map { String($0.output) }
+    static func current(_ tool: Tool) async -> Probe {
+        let result = await Shell.run(tool.currentCommand)
+        if result.status == 127 {
+            return await Shell.run("command -v \(tool.id)").status == 0 ? .unknown : .missing
+        }
+        return lastVersion(in: result)
+    }
+
+    private static func latest(_ tool: Tool) async -> Probe {
+        let result = await Shell.run(tool.latestCommand)
+        guard tool.id == "grok" else { return lastVersion(in: result) }
+        guard result.status == 0,
+              let line = result.output.split(separator: "\n").last(where: { $0.hasPrefix("{") }),
+              let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              let v = obj["latestVersion"] as? String else { return .unknown }
+        return .version(v)
+    }
+
+    private static func lastVersion(in result: (status: Int32, output: String)) -> Probe {
+        guard result.status == 0,
+              let m = result.output.matches(of: #/\d+\.\d+\.\d+[\w.\-]*/#).last else { return .unknown }
+        return .version(String(m.output))
     }
 }

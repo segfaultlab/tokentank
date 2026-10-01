@@ -45,7 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if popover.isShown {
             closePopover()
         } else {
-            model.refreshQuotaIfStale()
+            model.refreshQuota(maxAge: 120)
             showPopover()
         }
     }
@@ -62,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+signal(SIGPIPE, SIG_IGN)
 let app = NSApplication.shared
 let delegate = MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
