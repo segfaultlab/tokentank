@@ -304,8 +304,20 @@ enum ClaudeQuota {
         return httpDateFormatter.date(from: value)
     }
 
+    private static var lastRenewAt = Date.distantPast
+
+    private static func renewViaCLI() async {
+        guard Date().timeIntervalSince(lastRenewAt) >= 300 else { return }
+        lastRenewAt = Date()
+        _ = await Shell.run("claude -p --no-session-persistence /cost", timeout: 60)
+    }
+
     static func fetch() async throws -> Quota {
-        let creds = try await loadCredentials()
+        var creds = try await loadCredentials()
+        if creds.expires <= Date() {
+            await renewViaCLI()
+            creds = try await loadCredentials()
+        }
         guard creds.expires > Date() else {
             cached = nil
             throw FetchError("Claude 登录已过期，打开一次 claude 会自动刷新")
